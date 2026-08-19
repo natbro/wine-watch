@@ -1,0 +1,78 @@
+# WineWatch
+
+A macOS menu bar indicator for lingering Wine / CrossOver processes.
+
+Shows a wine-glass icon with a badge counting the wine processes currently
+running, so you can watch it drop to zero before changing a bottle's
+configuration and relaunching — instead of running `ps aux | grep wine`.
+
+- Menu bar only: no Dock icon, no window.
+- Badge is **red** with a count while wine processes are running, and
+  disappears (leaving a dimmed glass) once everything is gone.
+- Refreshes every 3, 4, or 5 seconds, and every half second for a few seconds
+  after a kill so the count tracks the teardown.
+- Requires macOS 14 or later.
+
+## Build
+
+```sh
+make app        # builds .dist/WineWatch.app (arm64, ad-hoc signed)
+make run        # builds and launches it
+make install    # installs to /Applications and launches it
+make universal  # arm64 + x86_64
+```
+
+Install to `/Applications` before turning on **Launch Automatically at
+Startup** — `SMAppService` registers the app by its path, so a login item
+pointing into `.dist/` breaks as soon as you `make clean`.
+
+## The menu
+
+| Item | What it does |
+| --- | --- |
+| *header* | Count of wine processes, and whether CrossOver itself is open |
+| *process list* | Each running process with its pid; submenu offers Quit / Force Quit for that one process |
+| **Close Wine Processes** | Everything: apps, Wine's services, then wineserver. `SIGTERM` first, `SIGKILL` for anything still alive after 2s. Hold ⌥ to go straight to `SIGKILL` |
+| **Close Wine Services Only** | wineserver and Wine's own Windows services, leaving application processes alone |
+| **Launch Automatically at Startup** | Login item, via `SMAppService` |
+| **Update Every** | Refresh interval: 3, 4, or 5 seconds |
+| **Show Green Badge When Clear** | Show a green `0` instead of no badge when nothing is running |
+
+Processes are killed apps-first, wineserver-last — tearing down the server
+first would just orphan everything above it.
+
+## What counts as a wine process
+
+A process owned by you (zombies excluded) whose executable path sits in a
+`winetemp-*` directory, a wine prefix, or a wine/CrossOver install — or whose
+name is a wine loader (`wineserver`, `wine64-preloader`, `wineloader`, …) or
+ends in `.exe`.
+
+Both `proc_pidpath` and `KERN_PROCARGS2` are consulted: wine rewrites `argv[0]`
+to the Windows path (`C:\windows\system32\services.exe`), which gives the nice
+display name, while the unix executable path is what reliably identifies the
+process as wine-hosted.
+
+The **CrossOver app itself is never counted and never killed** — it is the
+thing you are quitting by hand, so it is listed for information only.
+
+## Command line
+
+The same binary works headlessly, which is handy from a terminal or a script:
+
+```sh
+WineWatch --list             # print what WineWatch would count
+WineWatch --kill             # close every wine process
+WineWatch --kill --force     # ... skipping the polite SIGTERM
+WineWatch --kill-services    # close only wineserver and Wine's services
+WineWatch --selftest         # build the menu headlessly and print it
+WineWatch --preview out.png 10   # render the status icon at 10x
+```
+
+Inside the repo, `make list` and `make preview` wrap the first and last.
+
+## Notes
+
+The bundle is ad-hoc signed (`codesign -s -`). If macOS refuses the login item,
+approve WineWatch in System Settings › General › Login Items; the menu offers to
+open that pane when registration fails.
