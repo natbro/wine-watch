@@ -5,9 +5,9 @@ import AppKit
 enum GlassIcon {
 
     static let height: CGFloat = 18
-    private static let glassWidth: CGFloat = 13
+    private static let glassWidth: CGFloat = 10.63
     private static let badgeHeight: CGFloat = 11
-    private static let badgeOverlap: CGFloat = 5  // how far the badge sits over the glass
+    private static let badgeOverlap: CGFloat = 2  // how far the badge sits over the glass
 
     /// - Parameters:
     ///   - count: number to show in the badge; `nil` draws the bare glass.
@@ -21,9 +21,8 @@ enum GlassIcon {
         let image = NSImage(size: NSSize(width: width, height: height), flipped: false) { _ in
             // Resolved at draw time, so the icon follows the menu bar's
             // light/dark appearance without any explicit observation.
-            let ink = NSColor.labelColor.withAlphaComponent(dimmed ? 0.55 : 1.0)
-            ink.setFill()
-            glassPath().fill()
+            NSColor.labelColor.setFill()
+            fillGlass(alpha: dimmed ? 0.55 : 1.0)
 
             if let label {
                 drawBadge(label, width: badgeWidth, color: color)
@@ -81,32 +80,55 @@ enum GlassIcon {
             withAttributes: attributes)
     }
 
-    /// Wine-glass silhouette: elliptical rim, tulip bowl, stem, footed base.
-    /// Laid out in a 13 x 18 box with the origin at the bottom-left.
-    private static func glassPath() -> NSBezierPath {
+    /// The Wine project's glass: a tall flute tilted so the rim leans left over
+    /// an offset, foreshortened foot. Traced from the outline and foot ellipse
+    /// of the official logo (WINE-logo.svg, Wikimedia Commons), normalised to a
+    /// 10.63 x 18 box with the origin at the bottom-left.
+    ///
+    /// Body and foot are kept as separate paths and filled separately: they
+    /// overlap at the stem, and a single non-zero fill would punch a hole there
+    /// if the two subpaths happened to wind in opposite directions.
+    private static func glassBodyPath() -> NSBezierPath {
         let path = NSBezierPath()
-
-        let leftRim = NSPoint(x: 1.7, y: 16.5)
-        let rightRim = NSPoint(x: 11.3, y: 16.5)
-        let bowlBottom = NSPoint(x: 6.5, y: 5.9)
-
-        path.move(to: leftRim)
-        // Control points sit just outside the rim so the bowl swells below it,
-        // then tuck in hard at the base -- a tulip, not a trophy cup.
-        path.curve(to: bowlBottom, controlPoint1: NSPoint(x: 1.3, y: 11.2), controlPoint2: NSPoint(x: 4.2, y: 5.9))
-        path.curve(to: rightRim, controlPoint1: NSPoint(x: 8.8, y: 5.9), controlPoint2: NSPoint(x: 11.7, y: 11.2))
-        // Far side of the rim, seen slightly from above.
-        path.curve(to: leftRim, controlPoint1: NSPoint(x: 11.3, y: 17.9), controlPoint2: NSPoint(x: 1.7, y: 17.9))
+        path.move(to: NSPoint(x: 6.74, y: 1.36))
+        path.curve(to: NSPoint(x: 7.99, y: 2.18), controlPoint1: NSPoint(x: 7.15, y: 1.46), controlPoint2: NSPoint(x: 7.73, y: 1.79))
+        path.curve(to: NSPoint(x: 6.17, y: 5.76), controlPoint1: NSPoint(x: 6.43, y: 2.8), controlPoint2: NSPoint(x: 6.38, y: 4.47))
+        path.line(to: NSPoint(x: 6.19, y: 6.06))
+        path.curve(to: NSPoint(x: 6.96, y: 7.85), controlPoint1: NSPoint(x: 6.28, y: 6.47), controlPoint2: NSPoint(x: 6.7, y: 7.4))
+        path.curve(to: NSPoint(x: 6.06, y: 17.65), controlPoint1: NSPoint(x: 8.17, y: 9.94), controlPoint2: NSPoint(x: 6.97, y: 14.1))
+        path.curve(to: NSPoint(x: 0.0, y: 16.25), controlPoint1: NSPoint(x: 5.07, y: 18.55), controlPoint2: NSPoint(x: 0.8, y: 17.58))
+        path.curve(to: NSPoint(x: 3.53, y: 7.18), controlPoint1: NSPoint(x: 0.64, y: 13.85), controlPoint2: NSPoint(x: 1.52, y: 9.06))
+        path.curve(to: NSPoint(x: 5.23, y: 5.85), controlPoint1: NSPoint(x: 3.98, y: 6.76), controlPoint2: NSPoint(x: 4.62, y: 6.59))
+        path.line(to: NSPoint(x: 5.37, y: 5.61))
+        path.curve(to: NSPoint(x: 5.47, y: 1.69), controlPoint1: NSPoint(x: 5.84, y: 4.31), controlPoint2: NSPoint(x: 6.44, y: 2.64))
+        path.curve(to: NSPoint(x: 6.74, y: 1.37), controlPoint1: NSPoint(x: 5.8, y: 1.43), controlPoint2: NSPoint(x: 6.33, y: 1.27))
         path.close()
-
-        path.append(NSBezierPath(rect: NSRect(x: 5.9, y: 1.7, width: 1.2, height: 4.7)))
-        path.append(
-            NSBezierPath(
-                roundedRect: NSRect(x: 2.2, y: 0.5, width: 8.6, height: 1.6),
-                xRadius: 0.8, yRadius: 0.8))
-
-        path.windingRule = .nonZero
         return path
+    }
+
+    private static func glassFootPath() -> NSBezierPath {
+        let path = NSBezierPath()
+        path.move(to: NSPoint(x: 6.79, y: 2.08))
+        path.curve(to: NSPoint(x: 3.33, y: 0.45), controlPoint1: NSPoint(x: 4.78, y: 1.69), controlPoint2: NSPoint(x: 3.23, y: 0.95))
+        path.curve(to: NSPoint(x: 7.16, y: 0.25), controlPoint1: NSPoint(x: 3.43, y: -0.06), controlPoint2: NSPoint(x: 5.14, y: -0.15))
+        path.curve(to: NSPoint(x: 10.63, y: 1.89), controlPoint1: NSPoint(x: 9.17, y: 0.65), controlPoint2: NSPoint(x: 10.73, y: 1.38))
+        path.curve(to: NSPoint(x: 6.79, y: 2.08), controlPoint1: NSPoint(x: 10.53, y: 2.4), controlPoint2: NSPoint(x: 8.81, y: 2.48))
+        path.close()
+        return path
+    }
+
+    /// Fills both paths as one group. Body and foot overlap at the stem, so
+    /// filling them separately at less than full alpha would double-darken the
+    /// overlap; a transparency layer applies the alpha to the composite.
+    private static func fillGlass(alpha: CGFloat = 1) {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        context.saveGState()
+        context.setAlpha(alpha)
+        context.beginTransparencyLayer(auxiliaryInfo: nil)
+        glassBodyPath().fill()
+        glassFootPath().fill()
+        context.endTransparencyLayer()
+        context.restoreGState()
     }
 
     // MARK: - App icon
@@ -127,7 +149,7 @@ enum GlassIcon {
                     NSColor(calibratedRed: 0.09, green: 0.08, blue: 0.10, alpha: 1),
                 ])?.draw(in: slab, angle: -90)
 
-            let glassHeight = slab.height * 0.62
+            let glassHeight = slab.height * 0.72
             let scale = glassHeight / height
             let transform = NSAffineTransform()
             transform.translateX(
@@ -137,7 +159,7 @@ enum GlassIcon {
             transform.concat()
 
             NSColor.white.setFill()
-            glassPath().fill()
+            fillGlass()
             return true
         }
     }

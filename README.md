@@ -2,7 +2,7 @@
 
 A macOS menu bar indicator for lingering Wine / CrossOver processes.
 
-Shows a wine-glass icon with a badge counting the wine processes currently
+Shows the Wine glass with a badge counting the wine processes currently
 running, so you can watch it drop to zero before changing a bottle's
 configuration and relaunching — instead of running `ps aux | grep wine`.
 
@@ -70,6 +70,15 @@ WineWatch --preview out.png 10   # render the status icon at 10x
 ```
 
 Inside the repo, `make list` and `make preview` wrap the first and last.
+
+## Credits
+
+The status icon is a monochrome silhouette traced from the official Wine logo
+([`WINE-logo.svg`](https://commons.wikimedia.org/wiki/File:WINE-logo.svg) on
+Wikimedia Commons — original design by Jon Parshall, SVG by Joel Holdsworth,
+from `wine.git/programs/winecfg/logo.svg`), which is licensed **LGPL-2.1-or-later**.
+Only the glass outline and foot ellipse are used, normalised into an 18pt box;
+`GlassIcon.swift` carries the resulting Bézier control points.
 
 ## Notes
 
