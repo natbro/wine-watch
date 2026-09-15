@@ -71,14 +71,20 @@ WineWatch --preview out.png 10   # render the status icon at 10x
 
 Inside the repo, `make list` and `make preview` wrap the first and last.
 
-## Credits
+## License
+
+WineWatch is **MIT** licensed — see [LICENSE](LICENSE) — with one file excepted.
 
 The status icon is a monochrome silhouette traced from the official Wine logo
 ([`WINE-logo.svg`](https://commons.wikimedia.org/wiki/File:WINE-logo.svg) on
 Wikimedia Commons — original design by Jon Parshall, SVG by Joel Holdsworth,
-from `wine.git/programs/winecfg/logo.svg`), which is licensed **LGPL-2.1-or-later**.
-Only the glass outline and foot ellipse are used, normalised into an 18pt box;
-`GlassIcon.swift` carries the resulting Bézier control points.
+from `wine.git/programs/winecfg/logo.svg`), which is **LGPL-2.1-or-later**.
+Because the traced control points are derived from that artwork, they are kept
+in their own file — `Sources/WineWatch/WineGlassPath.swift` — which is licensed
+LGPL-2.1-or-later rather than MIT. Everything else, including all the drawing,
+colouring and badging in `GlassIcon.swift`, is MIT.
+
+WineWatch is not affiliated with or endorsed by the Wine project or WineHQ.
 
 ## Notes
 
