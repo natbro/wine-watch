@@ -1,8 +1,13 @@
 APP        := WineWatch
 CONFIG     ?= release
-ARCHS      ?= arm64
+# Build for whatever this machine is unless asked otherwise; hardcoding arm64
+# silently cross-builds on an Intel Mac.
+ARCHS      ?= $(shell uname -m)
 ARCH_FLAGS := $(foreach a,$(ARCHS),--arch $(a))
-SWIFT_ARGS := -c $(CONFIG) $(ARCH_FLAGS)
+# Packagers pass --disable-sandbox here; SwiftPM's own sandbox fights Homebrew's.
+SWIFT_FLAGS ?=
+SWIFT_ARGS := -c $(CONFIG) $(ARCH_FLAGS) $(SWIFT_FLAGS)
+VERSION    := $(shell sed -n 's/.*current = "\(.*\)".*/\1/p' Sources/WineWatch/Version.swift)
 
 DIST     := .dist
 APP_DIR  := $(DIST)/$(APP).app
@@ -23,13 +28,15 @@ app: build
 	mkdir -p "$(CONTENTS)/MacOS" "$(CONTENTS)/Resources"
 	cp "$(BIN_PATH)/$(APP)" "$(CONTENTS)/MacOS/$(APP)"
 	cp Resources/Info.plist "$(CONTENTS)/Info.plist"
+	@/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $(VERSION)" "$(CONTENTS)/Info.plist"
+	@/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $(VERSION)" "$(CONTENTS)/Info.plist"
 	@rm -rf "$(DIST)/AppIcon.iconset"
 	@"$(BIN_PATH)/$(APP)" --export-icon "$(DIST)/AppIcon.iconset" \
 		&& iconutil -c icns "$(DIST)/AppIcon.iconset" -o "$(CONTENTS)/Resources/AppIcon.icns" \
 		|| echo "note: app icon generation skipped"
 	codesign --force --sign - --timestamp=none "$(APP_DIR)" >/dev/null 2>&1 \
 		|| echo "note: ad-hoc signing failed; launch-at-login may not work"
-	@echo "built $(APP_DIR)"
+	@echo "built $(APP_DIR) ($(VERSION), $(ARCHS))"
 
 ## Intel + Apple Silicon
 universal:

@@ -109,11 +109,16 @@ case "--selftest":
     delegate.dumpBadgeBehaviour()
     exit(0)
 
+case "--version", "-v":
+    print("WineWatch \(WineWatchVersion.current)")
+    exit(0)
+
 case "--help", "-h":
     print("""
     WineWatch — menu bar indicator for lingering Wine / CrossOver processes.
 
       (no arguments)        run the menu bar app
+      --version, -v         print the version
       --list, -l            print the wine processes WineWatch would count
       --kill [--force]      close every wine process (SIGTERM, then SIGKILL)
       --kill-services       close only wineserver and Wine's own services

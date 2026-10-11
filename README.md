@@ -16,7 +16,34 @@ configuration and relaunching — instead of running `ps aux | grep wine`.
   Activity Monitor reports no measurable energy impact.
 - Requires macOS 14 or later.
 
-## Build
+## Install
+
+```sh
+brew install natbro/tap/winewatch
+```
+
+WineWatch has no Dock icon, so launch it explicitly the first time:
+
+```sh
+open "$(brew --prefix)/opt/winewatch/WineWatch.app"
+```
+
+Homebrew keeps the app inside its own prefix. To have it turn up in Launchpad
+and Spotlight too:
+
+```sh
+ln -sfn "$(brew --prefix)/opt/winewatch/WineWatch.app" /Applications/WineWatch.app
+```
+
+Use WineWatch's own **Launch Automatically at Startup** rather than
+`brew services`: both register a login item, and WineWatch does not guard
+against running twice, so you would get two icons in the menu bar. The
+`opt` path above is stable across `brew upgrade`, so a login item pointing
+at it keeps working.
+
+The formula also puts the headless CLI on your `PATH` as `winewatch`.
+
+## Build from source
 
 ```sh
 make app        # builds .dist/WineWatch.app (arm64, ad-hoc signed)
@@ -27,7 +54,12 @@ make universal  # arm64 + x86_64
 
 Install to `/Applications` before turning on **Launch Automatically at
 Startup** — `SMAppService` registers the app by its path, so a login item
-pointing into `.dist/` breaks as soon as you `make clean`.
+pointing into `.dist/` breaks as soon as you `make clean`. (Installing with
+Homebrew instead gives you a stable `opt` path for free.)
+
+`make app` stamps the version from `Sources/WineWatch/Version.swift` into the
+bundle, and builds for this machine's architecture; pass `ARCHS` to override
+or `SWIFT_FLAGS=--disable-sandbox` when building inside a packaging sandbox.
 
 ## The menu
 
