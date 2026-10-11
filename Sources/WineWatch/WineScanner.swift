@@ -23,6 +23,12 @@ struct WineProcess: Hashable {
     let kind: Kind
 
     var isAlive: Bool { kill(pid, 0) == 0 || errno == EPERM }
+
+    /// A process keeps its identity when its parent dies and it is reparented
+    /// to launchd, so the cached entry is reused with the fresh ppid.
+    func reparented(to ppid: pid_t) -> WineProcess {
+        WineProcess(pid: pid, ppid: ppid, name: name, detail: detail, kind: kind)
+    }
 }
 
 /// Result of one sweep of the process table.
@@ -37,16 +43,249 @@ struct WineScan {
     var apps: [WineProcess] { processes.filter { $0.kind == .app } }
 }
 
-enum WineScanner {
+/// Sweeps the process table for wine-hosted processes.
+///
+/// This runs every few seconds forever, so it is written to do as little as
+/// possible in the steady state. Two things keep it cheap:
+///
+/// 1. **Identity caching.** A process cannot change what it is, so each one is
+///    classified once and the verdict is remembered against its (pid, start
+///    time) identity. A quiet machine therefore does no per-process work at
+///    all after the first sweep -- just one `sysctl` and a dictionary lookup
+///    per process.
+/// 2. **Byte matching.** Classification compares raw C strings with
+///    `strcasestr` / `strcasecmp` rather than building Swift `String`s and
+///    using `lowercased()` and `contains`. Those are Unicode-correct and
+///    accordingly slow: on a 1300-process machine they cost ~30ms per sweep,
+///    which is most of a menu bar app's entire energy budget.
+final class WineScanner {
 
-    // Unix-side wine binaries. Matched against the executable's base name.
-    private static let loaderNames: Set<String> = [
+    /// One scanner per process; it owns the classification cache.
+    static let shared = WineScanner()
+
+    /// Identifies a process across sweeps. The start time is what makes this
+    /// safe -- pids are recycled, and a recycled pid is a different program.
+    private struct Identity: Hashable {
+        let pid: pid_t
+        let startSeconds: Int
+        let startMicroseconds: Int32
+
+        init(_ proc: kinfo_proc) {
+            pid = proc.kp_proc.p_pid
+            startSeconds = proc.kp_proc.p_starttime.tv_sec
+            startMicroseconds = proc.kp_proc.p_starttime.tv_usec
+        }
+    }
+
+    private enum Verdict {
+        case ignored
+        case host(String)
+        case wine(WineProcess)
+    }
+
+    /// What the byte-level matching can decide on its own, before anything is
+    /// allocated. Naming a wine process needs its argv, so that is left to
+    /// `classify`, which can afford Swift strings for the handful of matches.
+    private enum Match {
+        case ignored
+        case host(String)
+        case wine
+    }
+
+    private var known: [Identity: Verdict] = [:]
+    private let lock = NSLock()
+
+    private var pathBuffer = [CChar](repeating: 0, count: 4096)
+    /// Allocated on first use: a machine that never runs wine never pays for it.
+    private lazy var argsBuffer = [CChar](repeating: 0, count: WineScanner.argMax())
+
+    // MARK: - Scanning
+
+    func scan() -> WineScan {
+        lock.lock()
+        defer { lock.unlock() }
+
+        var result = WineScan()
+        let me = getpid()
+        var seenHosts = Set<String>()
+
+        // Rebuilt rather than mutated, which prunes dead processes for free.
+        var live: [Identity: Verdict] = [:]
+        live.reserveCapacity(known.count + 16)
+
+        for proc in Self.processesForCurrentUser() {
+            let pid = proc.kp_proc.p_pid
+            guard pid > 0, pid != me else { continue }
+            // Zombies still appear in the process table and still answer
+            // kill(pid, 0); counting them would pin the badge above zero long
+            // after the bottle is actually gone.
+            guard proc.kp_proc.p_stat != SZOMB else { continue }
+
+            let identity = Identity(proc)
+            let verdict = known[identity] ?? classify(proc, pid: pid)
+            live[identity] = verdict
+
+            switch verdict {
+            case .ignored:
+                break
+            case .host(let name):
+                if seenHosts.insert(name).inserted { result.hosts.append(name) }
+            case .wine(let process):
+                result.processes.append(process.reparented(to: proc.kp_eproc.e_ppid))
+            }
+        }
+
+        known = live
+
+        result.processes.sort {
+            $0.kind == $1.kind
+                ? ($0.name.localizedCaseInsensitiveCompare($1.name) == .orderedSame
+                    ? $0.pid < $1.pid
+                    : $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending)
+                : $0.kind < $1.kind
+        }
+        result.hosts.sort()
+        return result
+    }
+
+    /// Everything expensive happens here, and only once per process.
+    private func classify(_ proc: kinfo_proc, pid: pid_t) -> Verdict {
+        var proc = proc
+
+        pathBuffer[0] = 0
+        _ = proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count))
+
+        let match: Match = pathBuffer.withUnsafeBufferPointer { buffer in
+            let path = buffer.baseAddress!
+            return withUnsafePointer(to: &proc.kp_proc.p_comm) { tuple in
+                tuple.withMemoryRebound(to: CChar.self, capacity: Int(MAXCOMLEN) + 1) { comm in
+                    Self.match(path: path, comm: comm)
+                }
+            }
+        }
+
+        // A wine process still needs its argv read for a usable name; that is
+        // the one remaining expensive call, and it runs for matches only.
+        switch match {
+        case .ignored: return .ignored
+        case .host(let label): return .host(label)
+        case .wine: break
+        }
+
+        let execPath = String(cString: pathBuffer)
+        let comm = Self.commName(proc)
+        let args = Self.processArguments(pid, &argsBuffer)
+        let windowsPath = args.argv.first ?? ""
+        let name = Self.displayName(comm: comm, execPath: execPath, windowsPath: windowsPath)
+
+        return .wine(
+            WineProcess(
+                pid: pid,
+                ppid: proc.kp_eproc.e_ppid,
+                name: name,
+                detail: windowsPath.isEmpty ? (args.execPath.isEmpty ? execPath : args.execPath) : windowsPath,
+                kind: Self.kind(of: name)))
+    }
+
+    // MARK: - Matching
+    //
+    // All of this works on NUL-terminated C strings: `path` from proc_pidpath
+    // and `comm` pointing straight into the kinfo_proc. Nothing here allocates.
+
+    private static func match(path: UnsafePointer<CChar>, comm: UnsafePointer<CChar>) -> Match {
+        for host in hostMarkers where contains(path, host.marker) {
+            return .host(host.label)
+        }
+        if let own = ownExecutablePath, equals(path, own) { return .ignored }
+        if let bundle = ownBundlePrefix, hasPrefix(path, bundle) { return .ignored }
+        return looksLikeWine(path: path, comm: comm) ? .wine : .ignored
+    }
+
+    /// `proc_pidpath` reports the wine loader image, which for every
+    /// wine-hosted process lives either in a "winetemp-*" directory or inside
+    /// the wine/CrossOver install, so the directory alone is a reliable marker
+    /// even when the file name itself is stale.
+    ///
+    /// The markers are deliberately anchored rather than bare "wine" substring
+    /// tests -- WineWatch's own path contains "winewatch", and so might yours.
+    private static func looksLikeWine(path: UnsafePointer<CChar>, comm: UnsafePointer<CChar>) -> Bool {
+        let base = baseName(path)
+        // WineWatch itself, or another copy of it, is not a wine process.
+        if hasPrefix(base, ownNamePrefix) || hasPrefix(comm, ownNamePrefix) { return false }
+
+        for marker in pathMarkers where contains(path, marker) { return true }
+
+        // Binary names, from the executable path or -- when that is unreadable
+        // -- from p_comm, which truncates at 16 characters.
+        return isWineBinaryName(base) || isWineBinaryName(comm)
+    }
+
+    private static func isWineBinaryName(_ name: UnsafePointer<CChar>) -> Bool {
+        guard name.pointee != 0 else { return false }
+        for loader in loaderNames where equals(name, loader) { return true }
+        if hasPrefix(name, winePrefix) || hasPrefix(name, wine64Prefix) { return true }
+        return hasSuffix(name, exeSuffix)
+    }
+
+    // MARK: - C string helpers
+
+    /// Interned for the process lifetime: these are compared thousands of times
+    /// a minute, and converting a Swift literal at each call would defeat the
+    /// point of matching on bytes.
+    private static func intern(_ string: String) -> UnsafePointer<CChar> {
+        UnsafePointer(strdup(string)!)
+    }
+
+    private static func contains(_ haystack: UnsafePointer<CChar>, _ needle: UnsafePointer<CChar>) -> Bool {
+        strcasestr(haystack, needle) != nil
+    }
+
+    private static func equals(_ a: UnsafePointer<CChar>, _ b: UnsafePointer<CChar>) -> Bool {
+        strcasecmp(a, b) == 0
+    }
+
+    private static func hasPrefix(_ string: UnsafePointer<CChar>, _ prefix: UnsafePointer<CChar>) -> Bool {
+        strncasecmp(string, prefix, strlen(prefix)) == 0
+    }
+
+    private static func hasSuffix(_ string: UnsafePointer<CChar>, _ suffix: UnsafePointer<CChar>) -> Bool {
+        let length = strlen(string), suffixLength = strlen(suffix)
+        guard length >= suffixLength else { return false }
+        return strcasecmp(string + length - suffixLength, suffix) == 0
+    }
+
+    private static func baseName(_ path: UnsafePointer<CChar>) -> UnsafePointer<CChar> {
+        guard let slash = strrchr(path, Int32(UInt8(ascii: "/"))) else { return path }
+        return UnsafePointer(slash).advanced(by: 1)
+    }
+
+    // MARK: - Markers
+
+    /// Bundles that manage wine but are not themselves wine.
+    private static let hostMarkers: [(marker: UnsafePointer<CChar>, label: String)] = [
+        ("/crossover.app/contents/macos/", "CrossOver"),
+        ("/wine stable.app/contents/macos/", "Wine Stable"),
+        ("/wine devel.app/contents/macos/", "Wine Devel"),
+        ("/wine staging.app/contents/macos/", "Wine Staging"),
+        ("/whisky.app/contents/macos/", "Whisky"),
+        ("/porting kit.app/contents/macos/", "Porting Kit"),
+    ].map { (intern($0.0), $0.1) }
+
+    /// Directory markers: where wine puts its loaders and prefixes.
+    private static let pathMarkers: [UnsafePointer<CChar>] = [
+        "winetemp-", "/crossover.app/", "/crossover/", "/wine/", "/wineprefix",
+        "/dosdevices/", "/wineskin", "/whisky.app/", "/winehq",
+    ].map(intern)
+
+    /// Unix-side wine binaries, matched against the executable's base name.
+    private static let loaderNamesText: Set<String> = [
         "wine", "wine64", "wine-preloader", "wine64-preloader",
         "wineloader", "wineloader64", "wineserver", "winedbg",
         "cxstart", "cxrun", "cxsetup", "cxdiag",
     ]
+    private static let loaderNames: [UnsafePointer<CChar>] = loaderNamesText.map(intern)
 
-    // Windows-side processes that wine always brings up for itself.
+    /// Windows-side processes that wine always brings up for itself.
     private static let serviceNames: Set<String> = [
         "services.exe", "plugplay.exe", "rpcss.exe", "svchost.exe",
         "winedevice.exe", "explorer.exe", "conhost.exe", "wineboot.exe",
@@ -54,126 +293,20 @@ enum WineScanner {
         "sihost.exe", "dllhost.exe", "cmd.exe",
     ]
 
-    /// Bundles that manage wine but are not themselves wine.
-    private static func hostAppName(forExecutablePath path: String) -> String? {
-        let lower = path.lowercased()
-        for (marker, label) in [
-            ("/crossover.app/contents/macos/", "CrossOver"),
-            ("/wine stable.app/contents/macos/", "Wine Stable"),
-            ("/wine devel.app/contents/macos/", "Wine Devel"),
-            ("/wine staging.app/contents/macos/", "Wine Staging"),
-            ("/whisky.app/contents/macos/", "Whisky"),
-            ("/porting kit.app/contents/macos/", "Porting Kit"),
-        ] where lower.contains(marker) {
-            return label
-        }
-        return nil
-    }
+    private static let exeSuffix = intern(".exe")
+    private static let winePrefix = intern("wine-")
+    private static let wine64Prefix = intern("wine64")
+    private static let ownNamePrefix = intern("winewatch")
 
-    // MARK: - Scanning
+    private static let ownExecutablePath: UnsafePointer<CChar>? =
+        Bundle.main.executableURL.map { intern($0.resolvingSymlinksInPath().path) }
 
-    static func scan() -> WineScan {
-        var scan = WineScan()
-        let me = getpid()
-        let uid = getuid()
-        var seenHosts = Set<String>()
-
-        var pathBuffer = [CChar](repeating: 0, count: 4096)
-        var argsBuffer = [CChar](repeating: 0, count: argMax())
-
-        for proc in allProcesses() {
-            let pid = proc.kp_proc.p_pid
-            guard pid > 0, pid != me else { continue }
-            guard proc.kp_eproc.e_ucred.cr_uid == uid else { continue }
-            // Zombies still appear in the process table and still answer
-            // kill(pid, 0); counting them would pin the badge above zero long
-            // after the bottle is actually gone.
-            guard proc.kp_proc.p_stat != SZOMB else { continue }
-
-            let comm = commName(proc)
-            let execPath = executablePath(pid, &pathBuffer)
-
-            if let host = hostAppName(forExecutablePath: execPath) {
-                if seenHosts.insert(host).inserted { scan.hosts.append(host) }
-                continue
-            }
-
-            let lowerExec = execPath.lowercased()
-            if let own = ownExecutable, lowerExec == own { continue }
-            if let bundle = ownBundle, lowerExec.hasPrefix(bundle) { continue }
-
-            guard looksLikeWine(comm: comm, execPath: execPath) else { continue }
-
-            // Only now is it worth the (much more expensive) argv read, which is
-            // what gives us the real, untruncated name and the Windows path.
-            let args = processArguments(pid, &argsBuffer)
-            let windowsPath = args.argv.first ?? ""
-            let name = displayName(comm: comm, execPath: execPath, windowsPath: windowsPath)
-
-            scan.processes.append(
-                WineProcess(
-                    pid: pid,
-                    ppid: proc.kp_eproc.e_ppid,
-                    name: name,
-                    detail: windowsPath.isEmpty ? (args.execPath.isEmpty ? execPath : args.execPath) : windowsPath,
-                    kind: classify(name)
-                ))
-        }
-
-        scan.processes.sort {
-            $0.kind == $1.kind
-                ? ($0.name.localizedCaseInsensitiveCompare($1.name) == .orderedSame
-                    ? $0.pid < $1.pid
-                    : $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending)
-                : $0.kind < $1.kind
-        }
-        scan.hosts.sort()
-        return scan
-    }
-
-    /// Cheap first pass. `proc_pidpath` reports the wine loader image, which for
-    /// every wine-hosted process lives either in a "winetemp-*" directory or
-    /// inside the wine/CrossOver install, so the directory alone is a reliable
-    /// marker even when the file name itself is stale.
-    ///
-    /// The markers are deliberately anchored rather than bare "wine" substring
-    /// tests -- WineWatch's own path contains "winewatch", and so might yours.
-    private static func looksLikeWine(comm: String, execPath: String) -> Bool {
-        let path = execPath.lowercased()
-        let base = (path as NSString).lastPathComponent
-        let name = comm.lowercased()
-
-        if isOwnProgram(base: base, comm: name) { return false }
-
-        // Directory markers: where wine puts its loaders and prefixes.
-        for marker in ["winetemp-", "/crossover.app/", "/crossover/", "/wine/", "/wineprefix",
-                       "/dosdevices/", "/wineskin", "/whisky.app/", "/winehq"]
-        where path.contains(marker) {
-            return true
-        }
-
-        // Binary names, from the executable path or -- when that is unreadable --
-        // from p_comm, which truncates at 16 characters.
-        for candidate in [base, name] where !candidate.isEmpty {
-            if loaderNames.contains(candidate) { return true }
-            if candidate.hasPrefix("wine-") || candidate.hasPrefix("wine64") { return true }
-            if candidate.hasSuffix(".exe") { return true }
-        }
-        return false
-    }
-
-    /// WineWatch itself, or another copy of it, is not a wine process.
-    private static func isOwnProgram(base: String, comm: String) -> Bool {
-        base.hasPrefix("winewatch") || comm.hasPrefix("winewatch")
-    }
-
-    private static let ownExecutable: String? =
-        Bundle.main.executableURL?.resolvingSymlinksInPath().path.lowercased()
-
-    private static let ownBundle: String? = {
-        let path = Bundle.main.bundlePath.lowercased()
-        return path.hasSuffix(".app") ? path + "/" : nil
+    private static let ownBundlePrefix: UnsafePointer<CChar>? = {
+        let path = Bundle.main.bundlePath
+        return path.hasSuffix(".app") ? intern(path + "/") : nil
     }()
+
+    // MARK: - Naming
 
     private static func displayName(comm: String, execPath: String, windowsPath: String) -> String {
         // The Windows-side argv[0] ("C:\windows\system32\services.exe") is the
@@ -187,9 +320,9 @@ enum WineScanner {
         return comm
     }
 
-    private static func classify(_ name: String) -> WineProcess.Kind {
+    private static func kind(of name: String) -> WineProcess.Kind {
         let lower = name.lowercased()
-        if loaderNames.contains(lower) || lower.hasPrefix("wineserver") { return .server }
+        if loaderNamesText.contains(lower) || lower.hasPrefix("wineserver") { return .server }
         if serviceNames.contains(lower) { return .service }
         return .app
     }
@@ -214,10 +347,46 @@ enum WineScanner {
         return survivors.map(\.pid)
     }
 
+    // MARK: - Benchmarking
+
+    /// Times a sweep cold (nothing cached, as at launch) and warm (the steady
+    /// state, which is what actually runs all day). Used by `--benchmark`.
+    static func benchmark(iterations: Int = 20) -> String {
+        func time(_ n: Int, _ work: () -> Void) -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            for _ in 0..<n { work() }
+            return Double(DispatchTime.now().uptimeNanoseconds - start) / Double(n) / 1_000_000
+        }
+
+        let scanner = WineScanner()
+        let all = processesForCurrentUser()
+        let found = scanner.scan()
+
+        let tList = time(iterations) { _ = processesForCurrentUser() }
+        let tCold = time(iterations) {
+            scanner.lock.lock()
+            scanner.known.removeAll(keepingCapacity: true)
+            scanner.lock.unlock()
+            _ = scanner.scan()
+        }
+        let tWarm = time(iterations) { _ = scanner.scan() }
+
+        return """
+        \(all.count) processes for this user, \(found.count) wine, \(found.hosts.count) host app(s)
+
+          sysctl KERN_PROC_UID      \(String(format: "%7.3f", tList)) ms
+          scan(), cold cache        \(String(format: "%7.3f", tCold)) ms
+          scan(), warm cache        \(String(format: "%7.3f", tWarm)) ms
+        """
+    }
+
     // MARK: - sysctl / libproc plumbing
 
-    private static func allProcesses() -> [kinfo_proc] {
-        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
+    /// Filtered by the kernel rather than by us: on a busy machine a third of
+    /// the process table belongs to root and never needs to cross into
+    /// userspace at all.
+    private static func processesForCurrentUser() -> [kinfo_proc] {
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_UID, Int32(bitPattern: getuid())]
         var size = 0
         guard sysctl(&mib, 4, nil, &size, nil, 0) == 0, size > 0 else { return [] }
         let stride = MemoryLayout<kinfo_proc>.stride
@@ -232,12 +401,6 @@ enum WineScanner {
         return withUnsafePointer(to: &copy.kp_proc.p_comm) {
             $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXCOMLEN) + 1) { String(cString: $0) }
         }
-    }
-
-    private static func executablePath(_ pid: pid_t, _ buffer: inout [CChar]) -> String {
-        buffer[0] = 0
-        guard proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 else { return "" }
-        return String(cString: buffer)
     }
 
     private static func argMax() -> Int {

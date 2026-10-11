@@ -11,6 +11,9 @@ configuration and relaunching — instead of running `ps aux | grep wine`.
   disappears (leaving a dimmed glass) once everything is gone.
 - Refreshes every 3, 4, or 5 seconds, and every half second for a few seconds
   after a kill so the count tracks the teardown.
+- Cheap enough to leave running: a sweep costs ~0.2ms on a 1300-process
+  machine, and the status item is only redrawn when the count changes, so
+  Activity Monitor reports no measurable energy impact.
 - Requires macOS 14 or later.
 
 ## Build
@@ -65,7 +68,8 @@ WineWatch --list             # print what WineWatch would count
 WineWatch --kill             # close every wine process
 WineWatch --kill --force     # ... skipping the polite SIGTERM
 WineWatch --kill-services    # close only wineserver and Wine's services
-WineWatch --selftest         # build the menu headlessly and print it
+WineWatch --selftest         # build the menu headlessly, and check badge redraws
+WineWatch --benchmark        # time a sweep, cold cache and warm
 WineWatch --preview out.png 10   # render the status icon at 10x
 ```
 

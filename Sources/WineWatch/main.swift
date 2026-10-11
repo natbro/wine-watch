@@ -4,7 +4,7 @@ import AppKit
 /// for generating the app icon at build time.
 switch CommandLine.arguments.dropFirst().first {
 case "--list", "-l":
-    let scan = WineScanner.scan()
+    let scan = WineScanner.shared.scan()
     for host in scan.hosts { print("[host]    \(host)") }
     for process in scan.processes {
         print(String(format: "%-8s %-6d %-28s %@",
@@ -78,7 +78,7 @@ case "--preview":
 case "--kill", "--kill-services":
     let servicesOnly = CommandLine.arguments.contains("--kill-services")
     let force = CommandLine.arguments.contains("--force")
-    let scan = WineScanner.scan()
+    let scan = WineScanner.shared.scan()
     let targets = servicesOnly ? scan.services : scan.processes
     guard !targets.isEmpty else {
         print("nothing to close")
@@ -95,11 +95,18 @@ case "--kill", "--kill-services":
     }
     exit(0)
 
+case "--benchmark":
+    print(WineScanner.benchmark())
+    exit(0)
+
 case "--selftest":
     // Exercises menu construction headlessly; a menu bar app that crashes on
     // first click is not much of an improvement over `ps aux | grep wine`.
     _ = NSApplication.shared
-    AppDelegate().dumpMenu()
+    let delegate = AppDelegate()
+    delegate.dumpMenu()
+    print("")
+    delegate.dumpBadgeBehaviour()
     exit(0)
 
 case "--help", "-h":

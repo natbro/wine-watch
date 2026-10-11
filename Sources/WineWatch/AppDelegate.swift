@@ -2,7 +2,7 @@ import AppKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
-    private var statusItem: NSStatusItem!
+    private var statusItem: NSStatusItem?
     private let menu = NSMenu()
     private var timer: Timer?
 
@@ -11,6 +11,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// instead of sitting stale for most of a refresh interval.
     private var fastPollUntil: Date?
     private var isScanning = false
+    /// The menu only needs rebuilding while the user is looking at it.
+    private var isMenuOpen = false
+    /// What the status item is currently showing, so an unchanged count does
+    /// not replace the image and force the menu bar to redraw.
+    private var renderedBadge: (count: Int, showBadge: Bool)?
 
     private let maxListedProcesses = 14
 
@@ -20,9 +25,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.setActivationPolicy(.accessory)
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.imagePosition = .imageOnly
+        statusItem?.button?.imagePosition = .imageOnly
         menu.delegate = self
-        statusItem.menu = menu
+        statusItem?.menu = menu
 
         updateIcon()
         refresh()
@@ -37,6 +42,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         timer?.invalidate()
         let interval = fastPollUntil.map { $0 > Date() ? 0.5 : Preferences.refreshInterval } ?? Preferences.refreshInterval
         let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in self?.tick() }
+        // Letting the system slide the wakeup lets it coalesce ours with other
+        // timers instead of waking the CPU on its own account.
+        timer.tolerance = interval * 0.25
         // .common keeps the badge live while the menu is open.
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
@@ -56,40 +64,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard !isScanning else { return }
         isScanning = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let result = WineScanner.scan()
+            let result = WineScanner.shared.scan()
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isScanning = false
                 self.scan = result
                 self.updateIcon()
-                if self.menu.numberOfItems > 0 { self.rebuildMenu() }
+                if self.isMenuOpen { self.rebuildMenu() }
                 completion?()
             }
         }
     }
 
-    private func updateIcon() {
+    /// Returns whether the status item's image was actually replaced, which is
+    /// what `--selftest` checks: suppressing redraws is most of the energy win,
+    /// and getting the comparison wrong would freeze the badge instead.
+    @discardableResult
+    private func updateIcon(force: Bool = false) -> Bool {
         let count = scan.count
         let showBadge = count > 0 || Preferences.showGreenBadgeWhenClear
         let color: NSColor = count > 0 ? .systemRed : .systemGreen
+        var redrew = false
 
-        statusItem.button?.image = GlassIcon.image(
-            count: showBadge ? count : nil,
-            color: color,
-            dimmed: count == 0)
+        // Assigning an image invalidates the status item and redraws that part
+        // of the menu bar, so only do it when the icon would actually differ.
+        if force || renderedBadge == nil
+            || renderedBadge! != (count: count, showBadge: showBadge)
+        {
+            statusItem?.button?.image = GlassIcon.image(
+                count: showBadge ? count : nil,
+                color: color,
+                dimmed: count == 0)
+            renderedBadge = (count: count, showBadge: showBadge)
+            redrew = true
+        }
 
         var tooltip = count == 0 ? "No wine processes running" : "\(count) wine process\(count == 1 ? "" : "es") running"
         if !scan.hosts.isEmpty {
             tooltip += " — \(scan.hosts.joined(separator: ", ")) open"
         }
-        statusItem.button?.toolTip = tooltip
+        statusItem?.button?.toolTip = tooltip
+        return redrew
     }
 
     // MARK: - Menu
 
     func menuNeedsUpdate(_ menu: NSMenu) {
+        isMenuOpen = true
         rebuildMenu()
         refresh()
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        isMenuOpen = false
     }
 
     func rebuildMenu() {
@@ -211,7 +238,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Builds the menu against the live process table and prints it, so the
     /// menu can be exercised without a menu bar (see `--selftest`).
     func dumpMenu() {
-        scan = WineScanner.scan()
+        scan = WineScanner.shared.scan()
         rebuildMenu()
 
         func print(_ menu: NSMenu, indent: String) {
@@ -227,6 +254,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         print(menu, indent: "")
         Swift.print("\n\(menu.numberOfItems) top-level items, icon width \(GlassIcon.image(count: scan.count, color: .systemRed, dimmed: false).size.width)")
+    }
+
+    /// Walks the badge through a sequence of counts and reports which of them
+    /// redrew the status item. Repeats must not redraw; changes must.
+    func dumpBadgeBehaviour() {
+        func fake(_ count: Int) -> WineScan {
+            WineScan(
+                processes: (0..<count).map {
+                    WineProcess(pid: pid_t($0 + 1), ppid: 1, name: "fake\($0).exe", detail: "", kind: .app)
+                },
+                hosts: [])
+        }
+
+        let sequence = [0, 0, 3, 3, 5, 0, 0]
+        let expected = [true, false, true, false, true, true, false]
+        var actual: [Bool] = []
+        for count in sequence {
+            scan = fake(count)
+            actual.append(updateIcon())
+        }
+
+        Swift.print("count:   " + sequence.map { String($0) }.joined(separator: "  "))
+        Swift.print("redrew:  " + actual.map { $0 ? "Y" : "." }.joined(separator: "  "))
+        Swift.print(actual == expected
+            ? "PASS — redraws only on change"
+            : "FAIL — expected \(expected.map { $0 ? "Y" : "." }.joined(separator: "  "))")
     }
 
     // MARK: - Actions
@@ -285,6 +338,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleGreenBadge(_ sender: NSMenuItem) {
         Preferences.showGreenBadgeWhenClear.toggle()
-        updateIcon()
+        updateIcon(force: true)
     }
 }
